@@ -4438,99 +4438,44 @@ class RandomizeVisitor final : public VNVisitor {
                 }
             }
 
-            // Store totalWeight in temp var (evaluated once, used twice)
-            const int distId = m_distNum++;
-            const std::string totalName = "__Vdist_total" + cvtToStr(distId);
-            AstVar* const totalVarp
-                = new AstVar{fl, VVarType::BLOCKTEMP, totalName, taskp->findUInt64DType()};
-            totalVarp->noSubst(true);
-            totalVarp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
-            totalVarp->funcLocal(true);
-            totalVarp->isInternal(true);
-            taskp->addStmtsp(totalVarp);
-            taskp->addStmtsp(
-                new AstAssign{fl, new AstVarRef{fl, totalVarp, VAccess::WRITE}, totalWeightExprp});
 
-            // bucketVar = (rand64() % totalWeight) + 1
-            const std::string bucketName = "__Vdist_bucket" + cvtToStr(distId);
-            AstVar* const bucketVarp
-                = new AstVar{fl, VVarType::BLOCKTEMP, bucketName, taskp->findUInt64DType()};
-            bucketVarp->noSubst(true);
-            bucketVarp->lifetime(VLifetime::AUTOMATIC_EXPLICIT);
-            bucketVarp->funcLocal(true);
-            bucketVarp->isInternal(true);
-            taskp->addStmtsp(bucketVarp);
-
-            AstNodeExpr* randp = new AstRand{fl, nullptr, false};
-            randp->dtypeSetUInt64();
-            taskp->addStmtsp(new AstAssign{
-                fl, new AstVarRef{fl, bucketVarp, VAccess::WRITE},
-                new AstAdd{
-                    fl, new AstConst{fl, AstConst::Unsized64{}, 1},
-                    new AstModDiv{fl, randp, new AstVarRef{fl, totalVarp, VAccess::READ}}}});
-
-            // Build cumulative sum expressions forward: cumSum[i] = w[0]+...+w[i]
-            std::vector<AstNodeExpr*> cumSums;
-            AstNodeExpr* runningSump = nullptr;
-            for (size_t i = 0; i < buckets.size(); ++i) {
-                if (!runningSump) {
-                    runningSump = buckets[i].weightExprp->cloneTreePure(false);
-                } else {
-                    runningSump = new AstAdd{fl, runningSump,
-                                             buckets[i].weightExprp->cloneTreePure(false)};
-                    runningSump->dtypeSetUInt64();
-                }
-                cumSums.push_back(runningSump->cloneTreePure(true));
-            }
-
-            // Build ConstraintIf chain backward (last bucket is unconditional default)
-            AstNode* chainp = nullptr;
-            for (int i = static_cast<int>(buckets.size()) - 1; i >= 0; --i) {
-                AstNodeExpr* constraintExprp;
-                if (const AstInsideRange* const irp = VN_CAST(buckets[i].rangep, InsideRange)) {
-                    AstNodeExpr* const exprCopy1p = distp->exprp()->cloneTreePure(false);
-                    exprCopy1p->user1(true);
-                    AstNodeExpr* const exprCopy2p = distp->exprp()->cloneTreePure(false);
-                    exprCopy2p->user1(true);
-                    AstGte* const gtep
-                        = new AstGte{fl, exprCopy1p, irp->lhsp()->cloneTreePure(false)};
+            // Replace 'dist' with a hard disjunction of all ranges.
+            // This avoids picking a bucket outside the solver which can lead to
+            // false UNSAT results and performance 'hangs' in large arrays.
+            AstNodeExpr* unionExprp = nullptr;
+            for (auto& bucket : buckets) {
+                AstNodeExpr* itemExprp;
+                if (const AstInsideRange* const irp = VN_CAST(bucket.rangep, InsideRange)) {
+                    AstNodeExpr* const gtep = new AstGte{fl, distp->exprp()->cloneTreePure(false),
+                                                         irp->lhsp()->cloneTreePure(false)};
                     gtep->user1(true);
-                    AstLte* const ltep
-                        = new AstLte{fl, exprCopy2p, irp->rhsp()->cloneTreePure(false)};
+                    AstNodeExpr* const ltep = new AstLte{fl, distp->exprp()->cloneTreePure(false),
+                                                         irp->rhsp()->cloneTreePure(false)};
                     ltep->user1(true);
-                    constraintExprp = new AstLogAnd{fl, gtep, ltep};
-                    constraintExprp->user1(true);
+                    itemExprp = new AstLogAnd{fl, gtep, ltep};
                 } else {
-                    AstNodeExpr* const exprCopyp = distp->exprp()->cloneTreePure(false);
-                    exprCopyp->user1(true);
-                    constraintExprp
-                        = new AstEq{fl, exprCopyp, buckets[i].rangep->cloneTreePure(false)};
-                    constraintExprp->user1(true);
+                    itemExprp = new AstEq{fl, distp->exprp()->cloneTreePure(false),
+                                          bucket.rangep->cloneTreePure(false)};
                 }
-
-                AstConstraintExpr* const thenp = new AstConstraintExpr{fl, constraintExprp};
-
-                if (!chainp) {
-                    chainp = thenp;
-                } else {
-                    AstNodeExpr* const condp
-                        = new AstLte{fl, new AstVarRef{fl, bucketVarp, VAccess::READ}, cumSums[i]};
-                    chainp = new AstConstraintIf{fl, condp, thenp, chainp};
+                itemExprp->user1(true);
+                if (!unionExprp) unionExprp = itemExprp;
+                else {
+                    unionExprp = new AstLogOr{fl, unionExprp, itemExprp};
+                    unionExprp->user1(true);
                 }
             }
 
-            if (chainp) {
-                constrExprp->replaceWith(chainp);
-                VL_DO_DANGLING(pushDeletep(constrExprp), constrExprp);
-            }
+            // Mark the new expression as depending on random variables
+            unionExprp->user1(true);
 
-            // Clean up nodes used only as clone templates (never inserted into tree)
+            constrExprp->replaceWith(new AstConstraintExpr{fl, unionExprp});
+            VL_DO_DANGLING(pushDeletep(constrExprp), constrExprp);
+
+            // Clean up nodes used only as clone templates
             for (auto& bucket : buckets) {
                 VL_DO_DANGLING(pushDeletep(bucket.weightExprp), bucket.weightExprp);
             }
-            VL_DO_DANGLING(pushDeletep(runningSump), runningSump);
-            // Last cumSum is unused (last bucket is unconditional default)
-            pushDeletep(cumSums.back());
+            VL_DO_DANGLING(pushDeletep(totalWeightExprp), totalWeightExprp);
         }
     }
 
